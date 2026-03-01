@@ -1,0 +1,20 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    
+    <Authors>Jacky</Authors>
+    <Company>Jacky</Company>
+    <Product>WinStacks</Product>
+    <Description>一款 Windows 智能桌面叠放工具</Description>
+    <Copyright>Copyright © 2026 Jacky. All rights reserved.</Copyright>
+    <FileVersion>1.0</FileVersion>
+    <AssemblyVersion>1.0</AssemblyVersion>
+  </PropertyGroup>
+
+</Project>

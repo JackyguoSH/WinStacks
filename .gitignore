@@ -1,0 +1,10 @@
+# 忽略编译生成的临时文件夹
+bin/
+obj/
+
+# 忽略本地用户配置文件
+*.user
+.vs/
+
+# 忽略日志文件
+WinStacks_DebugLog.txt
