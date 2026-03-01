@@ -48,6 +48,14 @@ namespace WinStacks
         public struct SHFILEINFO { public IntPtr hIcon; public int iIcon; public uint dwAttributes; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szDisplayName; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)] public string szTypeName; };
         [DllImport("shell32.dll", CharSet = CharSet.Auto)]
         public static extern IntPtr SHGetFileInfo(string pszPath, uint dwFileAttributes, ref SHFILEINFO psfi, uint cbSizeFileInfo, uint uFlags);
+        
+        [DllImport("shell32.dll")]
+        public static extern int SHGetStockIconInfo(uint siid, uint uFlags, ref SHSTOCKICONINFO psii);
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct SHSTOCKICONINFO { public uint cbSize; public IntPtr hIcon; public int iSysImageIndex; public int iIcon; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szPath; }
+        const uint SHGSI_ICON = 0x000000100; const uint SHGSI_LARGEICON = 0x000000000;
+        const uint SIID_DRIVEFIXED = 59; const uint SIID_RECYCLER = 31;
+
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         static extern bool DestroyIcon(IntPtr hIcon);
@@ -285,6 +293,18 @@ namespace WinStacks
         private ImageSource? GetNativeIcon(string path)
         {
             try {
+                if (path == "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}") {
+                    SHSTOCKICONINFO sii = new SHSTOCKICONINFO(); sii.cbSize = (uint)Marshal.SizeOf(typeof(SHSTOCKICONINFO));
+                    if (SHGetStockIconInfo(SIID_DRIVEFIXED, SHGSI_ICON | SHGSI_LARGEICON, ref sii) == 0 && sii.hIcon != IntPtr.Zero) {
+                        ImageSource img = Imaging.CreateBitmapSourceFromHIcon(sii.hIcon, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions()); DestroyIcon(sii.hIcon); return img;
+                    }
+                } else if (path == "::{645FF040-5081-101B-9F08-00AA002F954E}") {
+                    SHSTOCKICONINFO sii = new SHSTOCKICONINFO(); sii.cbSize = (uint)Marshal.SizeOf(typeof(SHSTOCKICONINFO));
+                    if (SHGetStockIconInfo(SIID_RECYCLER, SHGSI_ICON | SHGSI_LARGEICON, ref sii) == 0 && sii.hIcon != IntPtr.Zero) {
+                        ImageSource img = Imaging.CreateBitmapSourceFromHIcon(sii.hIcon, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions()); DestroyIcon(sii.hIcon); return img;
+                    }
+                }
+
                 SHFILEINFO shfi = new SHFILEINFO();
                 IntPtr res = SHGetFileInfo(path, 0, ref shfi, (uint)Marshal.SizeOf(shfi), SHGFI_ICON | SHGFI_LARGEICON);
                 if (res != IntPtr.Zero && shfi.hIcon != IntPtr.Zero) {
@@ -310,12 +330,14 @@ namespace WinStacks
             string[] files = Directory.GetFiles(desktopPath); string[] directories = Directory.GetDirectories(desktopPath);
 
             var categories = new Dictionary<string, List<string>>() {
-                { "照片", new List<string>() }, { "文档", new List<string>() }, { "影片", new List<string>() },
+                { "系统", new List<string>() }, { "照片", new List<string>() }, { "文档", new List<string>() }, { "影片", new List<string>() },
                 { "音乐", new List<string>() }, { "压缩包", new List<string>() }, { "应用程序", new List<string>() },
                 { "文件夹", new List<string>() }, { "其他", new List<string>() }
             };
 
             foreach (string dir in directories) categories["文件夹"].Add(dir);
+            categories["系统"].Add("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}");
+            categories["系统"].Add("::{645FF040-5081-101B-9F08-00AA002F954E}");
 
             foreach (string file in files) {
                 try {
@@ -376,6 +398,9 @@ namespace WinStacks
             TextBlock titleText = new TextBlock { Text = title, FontSize = 13, Foreground = Brushes.White, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Bottom, Margin = new Thickness(0, 0, 0, 5), Effect = new DropShadowEffect { Color = Colors.Black, BlurRadius = 4, ShadowDepth = 1, Opacity = 0.9 } };
             mainGrid.Children.Add(iconStackGrid); mainGrid.Children.Add(titleText);
             
+            mainGrid.AllowDrop = true;
+            System.Windows.Threading.DispatcherTimer? dragOpenTimer = null;
+
             mainGrid.MouseEnter += (s, e) => {
                 DoubleAnimation anim = new DoubleAnimation(1.1, TimeSpan.FromMilliseconds(150)) { EasingFunction = new CubicEase() { EasingMode = EasingMode.EaseOut } };
                 scaleTransform.BeginAnimation(ScaleTransform.ScaleXProperty, anim); scaleTransform.BeginAnimation(ScaleTransform.ScaleYProperty, anim);
@@ -385,12 +410,30 @@ namespace WinStacks
                 scaleTransform.BeginAnimation(ScaleTransform.ScaleXProperty, anim); scaleTransform.BeginAnimation(ScaleTransform.ScaleYProperty, anim);
             };
             mainGrid.MouseLeftButtonDown += (sender, e) => { ShowStackMenu(mainGrid, title, filePaths); e.Handled = true; };
+            
+            mainGrid.DragEnter += (s, e) => {
+                if (dragOpenTimer != null) { dragOpenTimer.Stop(); }
+                dragOpenTimer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(600) };
+                dragOpenTimer.Tick += (ts, te) => {
+                    if (dragOpenTimer != null) dragOpenTimer.Stop();
+                    ShowStackMenu(mainGrid, title, filePaths);
+                };
+                dragOpenTimer.Start();
+            };
+            mainGrid.DragLeave += (s, e) => { if (dragOpenTimer != null) dragOpenTimer.Stop(); };
+            mainGrid.Drop += (s, e) => { if (dragOpenTimer != null) dragOpenTimer.Stop(); };
+
             return mainGrid;
         }
 
         private void SafeOpenItem(string path, bool isDir)
         {
             try {
+                if (path.StartsWith("::")) {
+                    Process.Start(new ProcessStartInfo { FileName = "explorer.exe", Arguments = path, UseShellExecute = true });
+                    return;
+                }
+
                 if (isDir) { Process.Start(new ProcessStartInfo { FileName = "explorer.exe", Arguments = $"\"{path}\"", UseShellExecute = true }); } 
                 else { Process.Start(new ProcessStartInfo { FileName = path, UseShellExecute = true }); }
             } catch (Exception ex) {
@@ -449,38 +492,57 @@ namespace WinStacks
 
             _currentMenu.Deactivated += (s, e) => { if (!_keepMenuAlive) { safeCloseMenu(); } };
 
-            string currentSelectedPath = "";
-            bool isCurrentDir = false;
-            Border? selectedItemBorder = null;
+            List<string> currentSelectedPaths = new List<string>();
+            List<bool> isCurrentDirs = new List<bool>();
+            List<Border> selectedItemBorders = new List<Border>();
+            List<TextBlock> selectedItemTexts = new List<TextBlock>();
+            List<TextBox> selectedItemBoxes = new List<TextBox>();
 
             _currentMenu.KeyDown += (s, e) => {
-                if (string.IsNullOrEmpty(currentSelectedPath)) return;
+                if (currentSelectedPaths.Count == 0) return;
 
-                if (e.Key == Key.C && Keyboard.Modifiers == ModifierKeys.Control) {
+                if (e.Key == Key.F2 && currentSelectedPaths.Count == 1) {
+                    if (!currentSelectedPaths[0].StartsWith("::")) {
+                        TextBlock tb = selectedItemTexts[0];
+                        TextBox box = selectedItemBoxes[0];
+                        tb.Visibility = Visibility.Collapsed;
+                        box.Text = Path.GetFileNameWithoutExtension(currentSelectedPaths[0]);
+                        box.Visibility = Visibility.Visible;
+                        box.Focus();
+                        box.SelectAll();
+                        e.Handled = true;
+                    }
+                }
+                else if (e.Key == Key.C && Keyboard.Modifiers == ModifierKeys.Control) {
                     try {
-                        var sc = new System.Collections.Specialized.StringCollection(); sc.Add(currentSelectedPath);
+                        var sc = new System.Collections.Specialized.StringCollection();
+                        foreach (var p in currentSelectedPaths) sc.Add(p);
                         System.Windows.Clipboard.SetFileDropList(sc);
-                        if (selectedItemBorder != null) {
-                            selectedItemBorder.Background = new SolidColorBrush(Color.FromArgb(0x80, 0x4A, 0x90, 0xE2));
-                            var timer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(200) };
-                            timer.Tick += (ts, te) => { 
-                                if (selectedItemBorder != null) selectedItemBorder.Background = new SolidColorBrush(Color.FromArgb(0x40, 0xFF, 0xFF, 0xFF)); 
-                                timer.Stop(); 
-                            };
-                            timer.Start();
+                        foreach (var b in selectedItemBorders) {
+                            if (b != null) {
+                                b.Background = new SolidColorBrush(Color.FromArgb(0x80, 0x4A, 0x90, 0xE2));
+                                var timer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(200) };
+                                Border tb = b;
+                                timer.Tick += (ts, te) => { 
+                                    tb.Background = new SolidColorBrush(Color.FromArgb(0x40, 0xFF, 0xFF, 0xFF)); 
+                                    timer.Stop(); 
+                                };
+                                timer.Start();
+                            }
                         }
                     } catch { }
                 }
                 else if (e.Key == Key.Delete) {
-                    string targetPath = currentSelectedPath;
-                    bool targetIsDir = isCurrentDir;
-                    string fn = Path.GetFileName(targetPath);
-                    
+                    var targets = new List<string>(currentSelectedPaths);
+                    var dirs = new List<bool>(isCurrentDirs);
                     safeCloseMenu();
 
                     Application.Current.Dispatcher.InvokeAsync(() => {
-                        if (MessageBox.Show($"确定要把 {fn} 移入回收站吗？", "删除确认", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes) {
-                            PerformDelete(targetPath, targetIsDir);
+                        string msg = targets.Count == 1 ? $"确定要把 {Path.GetFileName(targets[0])} 移入回收站吗？" : $"确定要把这 {targets.Count} 个项目移入回收站吗？";
+                        if (MessageBox.Show(msg, "删除确认", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes) {
+                            for (int i = 0; i < targets.Count; i++) {
+                                PerformDelete(targets[i], dirs[i]);
+                            }
                         }
                     });
                 }
@@ -501,7 +563,10 @@ namespace WinStacks
 
             foreach (string path in filePaths) {
                 string fileName = Path.GetFileName(path);
-                bool isDir = Directory.Exists(path);
+                if (path == "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}") fileName = "此电脑";
+                else if (path == "::{645FF040-5081-101B-9F08-00AA002F954E}") fileName = "回收站";
+
+                bool isDir = Directory.Exists(path) || path.StartsWith("::");
 
                 Border itemBorder = new Border { Background = Brushes.Transparent, CornerRadius = new CornerRadius(6), Width = 76, Height = 88, Margin = new Thickness(4), Cursor = Cursors.Hand };
                 StackPanel itemPanel = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
@@ -514,10 +579,42 @@ namespace WinStacks
                 }
                 
                 TextBlock itemText = new TextBlock { Text = fileName, Foreground = Brushes.White, FontSize = 11, TextAlignment = TextAlignment.Center, TextWrapping = TextWrapping.Wrap, MaxHeight = 30, TextTrimming = TextTrimming.CharacterEllipsis, HorizontalAlignment = HorizontalAlignment.Center, Padding = new Thickness(2,0,2,0) };
-                itemPanel.Children.Add(itemText); itemBorder.Child = itemPanel;
+                itemPanel.Children.Add(itemText); 
 
-                itemBorder.MouseEnter += (s, e) => { if (itemBorder != selectedItemBorder) itemBorder.Background = new SolidColorBrush(Color.FromArgb(0x20, 0xFF, 0xFF, 0xFF)); };
-                itemBorder.MouseLeave += (s, e) => { if (itemBorder != selectedItemBorder) itemBorder.Background = Brushes.Transparent; };
+                TextBox editBox = new TextBox { Text = fileName, FontSize = 11, TextAlignment = TextAlignment.Center, Visibility = Visibility.Collapsed, Width = 70, MaxHeight = 30, TextWrapping = TextWrapping.Wrap, Padding = new Thickness(0), Margin = new Thickness(0) };
+                
+                Action<string> finishRename = (newName) => {
+                    editBox.Visibility = Visibility.Collapsed;
+                    itemText.Visibility = Visibility.Visible;
+                    if (string.IsNullOrWhiteSpace(newName) || newName == Path.GetFileName(path)) return;
+                    
+                    try {
+                        string dir = Path.GetDirectoryName(path);
+                        string ext = isDir ? "" : Path.GetExtension(path);
+                        string newFileName = isDir ? newName : (newName.EndsWith(ext, StringComparison.OrdinalIgnoreCase) ? newName : newName + ext);
+                        string newPath = Path.Combine(dir, newFileName);
+                        
+                        if (isDir) Directory.Move(path, newPath);
+                        else File.Move(path, newPath);
+                        
+                        itemText.Text = newFileName;
+                        
+                        int idx = currentSelectedPaths.IndexOf(path);
+                        if (idx >= 0) currentSelectedPaths[idx] = newPath;
+                    } catch { }
+                };
+
+                editBox.LostFocus += (s, e) => { finishRename(editBox.Text); };
+                editBox.KeyDown += (s, e) => {
+                    if (e.Key == Key.Enter) { finishRename(editBox.Text); e.Handled = true; }
+                    else if (e.Key == Key.Escape) { editBox.Visibility = Visibility.Collapsed; itemText.Visibility = Visibility.Visible; e.Handled = true; }
+                };
+                itemPanel.Children.Add(editBox);
+
+                itemBorder.Child = itemPanel;
+
+                itemBorder.MouseEnter += (s, e) => { if (!selectedItemBorders.Contains(itemBorder)) itemBorder.Background = new SolidColorBrush(Color.FromArgb(0x20, 0xFF, 0xFF, 0xFF)); };
+                itemBorder.MouseLeave += (s, e) => { if (!selectedItemBorders.Contains(itemBorder)) itemBorder.Background = Brushes.Transparent; };
                 
                 ContextMenu ctxMenu = new ContextMenu();
                 
@@ -547,7 +644,11 @@ namespace WinStacks
                 copyItem.Click += (s, e) => { 
                     safeCloseMenu();
                     Application.Current.Dispatcher.InvokeAsync(() => {
-                        try { var sc = new System.Collections.Specialized.StringCollection(); sc.Add(path); System.Windows.Clipboard.SetFileDropList(sc); } catch { } 
+                        try { 
+                            var sc = new System.Collections.Specialized.StringCollection(); 
+                            if (currentSelectedPaths.Contains(path)) { foreach (var p in currentSelectedPaths) sc.Add(p); } else { sc.Add(path); }
+                            System.Windows.Clipboard.SetFileDropList(sc); 
+                        } catch { } 
                     });
                 };
                 ctxMenu.Items.Add(copyItem);
@@ -572,35 +673,99 @@ namespace WinStacks
                         } catch { } 
                     });
                 };
-                ctxMenu.Items.Add(propItem);
+                if (!path.StartsWith("::")) ctxMenu.Items.Add(propItem);
+
+                MenuItem renameItem = new MenuItem { Header = "重命名 (F2)" };
+                renameItem.Click += (s, e) => {
+                    if (!path.StartsWith("::")) {
+                        itemText.Visibility = Visibility.Collapsed;
+                        editBox.Text = Path.GetFileNameWithoutExtension(path);
+                        editBox.Visibility = Visibility.Visible;
+                        editBox.Focus();
+                        editBox.SelectAll();
+                    }
+                };
+                if (!path.StartsWith("::")) ctxMenu.Items.Add(renameItem);
 
                 MenuItem delItem = new MenuItem { Header = "删除文件", Foreground = Brushes.Red };
                 delItem.Click += (s, e) => {
                     safeCloseMenu(); 
                     Application.Current.Dispatcher.InvokeAsync(() => {
-                        if (MessageBox.Show($"确定要把 {fileName} 移入回收站吗？", "删除确认", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes) {
-                            PerformDelete(path, isDir);
+                        if (currentSelectedPaths.Contains(path) && currentSelectedPaths.Count > 1) {
+                            if (MessageBox.Show($"确定要把这 {currentSelectedPaths.Count} 个项目移入回收站吗？", "删除确认", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes) {
+                                for(int i=0; i<currentSelectedPaths.Count; i++) {
+                                    if (!currentSelectedPaths[i].StartsWith("::")) PerformDelete(currentSelectedPaths[i], isCurrentDirs[i]);
+                                }
+                            }
+                        } else {
+                            if (MessageBox.Show($"确定要把 {fileName} 移入回收站吗？", "删除确认", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes) {
+                                PerformDelete(path, isDir);
+                            }
                         }
                     });
                 };
-                ctxMenu.Items.Add(delItem);
+                if (!path.StartsWith("::")) ctxMenu.Items.Add(delItem);
                 itemBorder.ContextMenu = ctxMenu;
 
                 Point startPoint = new Point();
                 bool isMouseDown = false;
+                System.Windows.Threading.DispatcherTimer? renameTimer = null;
+                bool wasAlreadySelected = false;
 
                 itemBorder.MouseLeftButtonDown += (s, e) => {
+                    wasAlreadySelected = selectedItemBorders.Contains(itemBorder);
+                    if (renameTimer != null) { renameTimer.Stop(); renameTimer = null; }
+
                     if (e.ClickCount == 2) {
                         isMouseDown = false;
                         safeCloseMenu();
                         Application.Current.Dispatcher.InvokeAsync(() => { SafeOpenItem(path, isDir); });
                         e.Handled = true;
                     } else {
-                        if (selectedItemBorder != null && selectedItemBorder != itemBorder) { selectedItemBorder.Background = Brushes.Transparent; }
-                        selectedItemBorder = itemBorder;
-                        currentSelectedPath = path;
-                        isCurrentDir = isDir;
-                        itemBorder.Background = new SolidColorBrush(Color.FromArgb(0x40, 0xFF, 0xFF, 0xFF)); 
+                        if (Keyboard.Modifiers == ModifierKeys.Control) {
+                            if (wasAlreadySelected) {
+                                selectedItemBorders.Remove(itemBorder);
+                                selectedItemTexts.Remove(itemText);
+                                selectedItemBoxes.Remove(editBox);
+                                int idx = currentSelectedPaths.IndexOf(path);
+                                if(idx >= 0) { currentSelectedPaths.RemoveAt(idx); isCurrentDirs.RemoveAt(idx); }
+                                itemBorder.Background = Brushes.Transparent;
+                            } else {
+                                selectedItemBorders.Add(itemBorder);
+                                selectedItemTexts.Add(itemText);
+                                selectedItemBoxes.Add(editBox);
+                                currentSelectedPaths.Add(path);
+                                isCurrentDirs.Add(isDir);
+                                itemBorder.Background = new SolidColorBrush(Color.FromArgb(0x40, 0xFF, 0xFF, 0xFF)); 
+                            }
+                        } else {
+                            if (wasAlreadySelected && currentSelectedPaths.Count == 1 && !path.StartsWith("::")) {
+                                renameTimer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+                                renameTimer.Tick += (ts, te) => {
+                                    if (renameTimer != null) renameTimer.Stop();
+                                    itemText.Visibility = Visibility.Collapsed;
+                                    editBox.Text = Path.GetFileNameWithoutExtension(path);
+                                    editBox.Visibility = Visibility.Visible;
+                                    editBox.Focus();
+                                    editBox.SelectAll();
+                                };
+                                renameTimer.Start();
+                            } else {
+                                foreach (var b in selectedItemBorders) b.Background = Brushes.Transparent;
+                                selectedItemBorders.Clear();
+                                selectedItemTexts.Clear();
+                                selectedItemBoxes.Clear();
+                                currentSelectedPaths.Clear();
+                                isCurrentDirs.Clear();
+
+                                selectedItemBorders.Add(itemBorder);
+                                selectedItemTexts.Add(itemText);
+                                selectedItemBoxes.Add(editBox);
+                                currentSelectedPaths.Add(path);
+                                isCurrentDirs.Add(isDir);
+                                itemBorder.Background = new SolidColorBrush(Color.FromArgb(0x40, 0xFF, 0xFF, 0xFF)); 
+                            }
+                        }
                         
                         startPoint = e.GetPosition(null); 
                         isMouseDown = true;
@@ -613,10 +778,12 @@ namespace WinStacks
                     if (isMouseDown && e.LeftButton == MouseButtonState.Pressed) {
                         Vector diff = startPoint - e.GetPosition(null);
                         if (Math.Abs(diff.X) > SystemParameters.MinimumHorizontalDragDistance || Math.Abs(diff.Y) > SystemParameters.MinimumVerticalDragDistance) {
+                            if (renameTimer != null) { renameTimer.Stop(); renameTimer = null; }
                             isMouseDown = false;
                             _keepMenuAlive = true; 
                             try {
-                                DataObject dragData = new DataObject(DataFormats.FileDrop, new string[] { path });
+                                string[] dragFiles = currentSelectedPaths.Contains(path) ? currentSelectedPaths.ToArray() : new string[] { path };
+                                DataObject dragData = new DataObject(DataFormats.FileDrop, dragFiles);
                                 DragDrop.DoDragDrop(itemBorder, dragData, DragDropEffects.Copy | DragDropEffects.Move);
                             } catch { } 
                             finally {
@@ -627,7 +794,59 @@ namespace WinStacks
                     }
                 };
 
-                itemBorder.MouseLeftButtonUp += (s, e) => { isMouseDown = false; };
+                itemBorder.MouseLeftButtonUp += (s, e) => { 
+                    isMouseDown = false; 
+                };
+
+                bool isRecycleBin = path == "::{645FF040-5081-101B-9F08-00AA002F954E}";
+                if ((isDir && !path.StartsWith("::")) || isRecycleBin) {
+                    itemBorder.AllowDrop = true;
+                    itemBorder.DragEnter += (s, e) => {
+                        if (e.Data.GetDataPresent(DataFormats.FileDrop)) {
+                            itemBorder.Background = new SolidColorBrush(Color.FromArgb(0x60, 0x4A, 0x90, 0xE2)); 
+                        }
+                    };
+                    itemBorder.DragLeave += (s, e) => {
+                        if (!selectedItemBorders.Contains(itemBorder)) itemBorder.Background = Brushes.Transparent;
+                        else itemBorder.Background = new SolidColorBrush(Color.FromArgb(0x40, 0xFF, 0xFF, 0xFF));
+                    };
+                    itemBorder.Drop += (s, e) => {
+                        if (!selectedItemBorders.Contains(itemBorder)) itemBorder.Background = Brushes.Transparent;
+                        else itemBorder.Background = new SolidColorBrush(Color.FromArgb(0x40, 0xFF, 0xFF, 0xFF));
+                        
+                        if (e.Data.GetDataPresent(DataFormats.FileDrop)) {
+                            string[] files = (string[])e.Data.GetData(DataFormats.FileDrop);
+                            bool actedAny = false;
+                            
+                            if (isRecycleBin) {
+                                if (MessageBox.Show($"确定要把这 {files.Length} 个项目移入回收站吗？", "删除确认", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes) {
+                                    foreach (string sourceFile in files) {
+                                        try { PerformDelete(sourceFile, Directory.Exists(sourceFile)); actedAny = true; } catch { }
+                                    }
+                                }
+                            } else {
+                                foreach (string sourceFile in files) {
+                                    if (sourceFile.Equals(path, StringComparison.OrdinalIgnoreCase)) continue;
+                                    try {
+                                        string destFile = Path.Combine(path, Path.GetFileName(sourceFile));
+                                        if (Directory.Exists(sourceFile)) {
+                                            Directory.Move(sourceFile, destFile);
+                                        } else {
+                                            File.Move(sourceFile, destFile);
+                                        }
+                                        actedAny = true;
+                                    } catch { }
+                                }
+                            }
+                            
+                            if (actedAny) {
+                                safeCloseMenu();
+                                RefreshDesktop();
+                            }
+                        }
+                    };
+                }
+
                 gridPanel.Children.Add(itemBorder);
             }
 
