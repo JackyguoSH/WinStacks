@@ -8,3 +8,6 @@ obj/
 
 # 忽略日志文件
 WinStacks_DebugLog.txt
+
+# 忽略临时工具文件
+ISSUE_*.md
