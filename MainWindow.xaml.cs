@@ -12,6 +12,9 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Interop;
+using System.Windows.Threading;
+using System.Linq;
+using System.Security.Permissions;
 using System.Windows.Media;
 using System.Windows.Media.Effects;
 using System.Windows.Media.Animation;
@@ -96,10 +99,14 @@ namespace WinStacks
 
         private FileSystemWatcher? _watcher;
         private System.Windows.Forms.NotifyIcon? _trayIcon;
-        private Window? _currentMenu;
+        private Dictionary<string, Window> _openMenus = new Dictionary<string, Window>();
+        private Dictionary<string, Rect> _menuTheoreticalPositions = new Dictionary<string, Rect>();
         private bool _keepMenuAlive = false; 
         private bool _iconsRestored = false;
         private int _currentLayoutMode = 0; 
+        private Dictionary<string, string> _appConfig = new Dictionary<string, string>();
+
+        private string Loc(string zh, string en) { return _appConfig.TryGetValue("Lang", out var lang) && lang == "en" ? en : zh; }
 
         // 发布版移除日志功能
         private void LogDebug(string message) { }
@@ -136,37 +143,57 @@ namespace WinStacks
             
             PinToDesktop();
             EnsureDesktopIconsHidden();
+            LoadLayoutSettings();
             ScanDesktopFiles();
             StartDesktopWatcher();
-            LoadLayoutSettings();
         }
 
         private void LoadLayoutSettings()
         {
             try {
                 string appDataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "WinStacks");
-                string configPath = Path.Combine(appDataDir, "layout_config.txt");
+                string configPath = Path.Combine(appDataDir, "config.txt");
+                _appConfig.Clear();
 
-                if (!File.Exists(configPath)) {
-                    Directory.CreateDirectory(appDataDir);
-                    File.WriteAllText(configPath, "0"); 
-                    ApplyLayout(0, false); 
-                    
-                    Application.Current.Dispatcher.InvokeAsync(() => {
-                        OpenSettingsWindow();
-                        PinToDesktop();
-                    }, System.Windows.Threading.DispatcherPriority.ApplicationIdle);
-                } else {
-                    string savedMode = File.ReadAllText(configPath);
-                    if (int.TryParse(savedMode, out int mode)) {
-                        ApplyLayout(mode, false);
-                    } else {
-                        ApplyLayout(0, false);
+                if (File.Exists(configPath)) {
+                    foreach (var line in File.ReadAllLines(configPath)) {
+                        int idx = line.IndexOf('=');
+                        if (idx > 0) _appConfig[line.Substring(0, idx).Trim()] = line.Substring(idx + 1).Trim();
                     }
+                }
+
+                if (_appConfig.TryGetValue("Layout", out string? modeStr) && int.TryParse(modeStr, out int mode)) {
+                    ApplyLayout(mode, false);
+                } else {
+                    ApplyLayout(0, false);
+                }
+                
+                if (!_appConfig.ContainsKey("Lang")) _appConfig["Lang"] = "zh";
+                if (!_appConfig.ContainsKey("EnableRecentFiles")) _appConfig["EnableRecentFiles"] = "true";
+                if (!_appConfig.ContainsKey("MaxRecentFiles")) _appConfig["MaxRecentFiles"] = "8";
+                string recentName = Loc("最近使用", "Recent Files");
+                if (!_appConfig.ContainsKey($"Stack_{recentName}")) _appConfig[$"Stack_{recentName}"] = "100,100";
+
+                // Migration from old config
+                string oldConfig = Path.Combine(appDataDir, "layout_config.txt");
+                if (File.Exists(oldConfig) && !File.Exists(configPath)) {
+                    if (int.TryParse(File.ReadAllText(oldConfig), out int oldMode)) { ApplyLayout(oldMode, true); }
+                    try { File.Delete(oldConfig); } catch { }
                 }
             } catch { 
                 ApplyLayout(0, false); 
             }
+        }
+
+        private void SaveConfig()
+        {
+            try {
+                string appDataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "WinStacks");
+                Directory.CreateDirectory(appDataDir);
+                List<string> lines = new List<string>();
+                foreach (var kvp in _appConfig) lines.Add($"{kvp.Key}={kvp.Value}");
+                File.WriteAllLines(Path.Combine(appDataDir, "config.txt"), lines);
+            } catch { }
         }
 
         private void SetupTrayIcon()
@@ -175,15 +202,13 @@ namespace WinStacks
             string exePath = Environment.ProcessPath ?? AppContext.BaseDirectory;
             try { _trayIcon.Icon = System.Drawing.Icon.ExtractAssociatedIcon(exePath); } catch { }
             
-            _trayIcon.Text = "WinStacks - 智能叠放";
+            _trayIcon.Text = Loc("WinStacks - 智能叠放", "WinStacks - Smart Stacks");
             _trayIcon.Visible = true;
 
             var menu = new System.Windows.Forms.ContextMenuStrip();
-            menu.Items.Add("👁️ 隐藏/显示桌面图标", null, (s, e) => ToggleDesktopIcons());
+            menu.Items.Add(Loc("⚙️ 设置中心 / Settings", "⚙️ Settings Center"), null, (s, e) => OpenSettingsWindow());
             menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
-            menu.Items.Add("⚙️ 排版设置", null, (s, e) => OpenSettingsWindow());
-            menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
-            menu.Items.Add("❌ 退出 WinStacks", null, (s, e) => ExitApplication());
+            menu.Items.Add(Loc("❌ 退出程序 / Exit", "❌ Exit WinStacks"), null, (s, e) => ExitApplication());
             
             _trayIcon.ContextMenuStrip = menu;
             _trayIcon.DoubleClick += (s, e) => OpenSettingsWindow();
@@ -254,20 +279,80 @@ namespace WinStacks
         private void OpenSettingsWindow()
         {
             Window settingsWin = new Window {
-                Title = "WinStacks 排版设置", Width = 320, Height = 200, WindowStartupLocation = WindowStartupLocation.CenterScreen,
+                Title = Loc("WinStacks 设置中心", "WinStacks Settings Center"), Width = 340, Height = 560, WindowStartupLocation = WindowStartupLocation.CenterScreen,
                 ResizeMode = ResizeMode.NoResize, Topmost = true, Background = new SolidColorBrush(Color.FromRgb(30, 30, 30)),
                 Foreground = Brushes.White, WindowStyle = WindowStyle.ToolWindow 
             };
             StackPanel sp = new StackPanel { Margin = new Thickness(25) };
-            sp.Children.Add(new TextBlock { Text = "选择叠放区的位置：", FontSize = 14, FontWeight = FontWeights.Bold, Margin = new Thickness(0, 0, 0, 15) });
+            
+            sp.Children.Add(new TextBlock { Text = Loc("排版布局 (Layout Position)：", "Stack Layout Position:"), FontSize = 14, FontWeight = FontWeights.Bold, Margin = new Thickness(0, 0, 0, 10) });
             ComboBox cbLayout = new ComboBox { Height = 35, FontSize = 14 };
-            cbLayout.Items.Add("📍 右侧 - 垂直排版 (Mac 风格)"); cbLayout.Items.Add("📍 左侧 - 垂直排版 (Win 风格)");
-            cbLayout.Items.Add("📍 顶部 - 水平排版"); cbLayout.Items.Add("📍 底部 - 水平排版 (Dock 风格)");
+            cbLayout.Items.Add(Loc("📍 右侧 - 垂直排版 (Mac 风格)", "📍 Right - Vertical layout")); cbLayout.Items.Add(Loc("📍 左侧 - 垂直排版 (Win 风格)", "📍 Left - Vertical layout"));
+            cbLayout.Items.Add(Loc("📍 顶部 - 水平排版", "📍 Top - Horizontal layout")); cbLayout.Items.Add(Loc("📍 底部 - 水平排版 (Dock 风格)", "📍 Bottom - Horizontal layout"));
             cbLayout.SelectedIndex = _currentLayoutMode; 
             sp.Children.Add(cbLayout);
 
-            Button btnApply = new Button { Content = "保存并应用", Height = 35, Margin = new Thickness(0, 20, 0, 0), Background = new SolidColorBrush(Color.FromRgb(0, 120, 215)), Foreground = Brushes.White, BorderThickness = new Thickness(0), Cursor = Cursors.Hand };
-            btnApply.Click += (s, e) => { ApplyLayout(cbLayout.SelectedIndex, true); settingsWin.Close(); };
+            sp.Children.Add(new TextBlock { Text = Loc("显示语言 (Display Language)：", "Display Language:"), FontSize = 14, FontWeight = FontWeights.Bold, Margin = new Thickness(0, 15, 0, 10) });
+            ComboBox cbLang = new ComboBox { Height = 35, FontSize = 14 };
+            cbLang.Items.Add("简体中文 (Chinese)"); cbLang.Items.Add("English");
+            cbLang.SelectedIndex = _appConfig.TryGetValue("Lang", out var l) && l == "en" ? 1 : 0;
+            sp.Children.Add(cbLang);
+
+            sp.Children.Add(new Separator { Margin = new Thickness(0, 15, 0, 15), Background = new SolidColorBrush(Color.FromArgb(0x40, 0xFF, 0xFF, 0xFF)) });
+
+            sp.Children.Add(new TextBlock { Text = Loc("最近使用 (Recent Files)：", "Recent Files Feature:"), FontSize = 14, FontWeight = FontWeights.Bold, Margin = new Thickness(0, 0, 0, 10) });
+            CheckBox chkRecents = new CheckBox { Content = Loc("启用“最近使用”智能叠放", "Enable 'Recent Files' Stack"), Foreground = Brushes.White, FontSize = 13, Margin = new Thickness(0, 0, 0, 10), VerticalContentAlignment = VerticalAlignment.Center };
+            chkRecents.IsChecked = _appConfig.TryGetValue("EnableRecentFiles", out string? recEn) ? recEn == "true" : true;
+            sp.Children.Add(chkRecents);
+            
+            StackPanel maxFilesSp = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 10) };
+            maxFilesSp.Children.Add(new TextBlock { Text = Loc("显示数量：", "Item count: "), Foreground = Brushes.White, VerticalAlignment = VerticalAlignment.Center });
+            TextBox txtMaxFiles = new TextBox { Width = 40, Text = _appConfig.TryGetValue("MaxRecentFiles", out string? maxF) ? maxF : "8", TextAlignment = TextAlignment.Center, VerticalContentAlignment = VerticalAlignment.Center };
+            maxFilesSp.Children.Add(txtMaxFiles);
+            sp.Children.Add(maxFilesSp);
+
+            sp.Children.Add(new Separator { Margin = new Thickness(0, 5, 0, 15), Background = new SolidColorBrush(Color.FromArgb(0x40, 0xFF, 0xFF, 0xFF)) });
+
+            Button btnToggleIcons = new Button { Content = Loc("👁️ 隐藏/显示原生桌面图标", "👁️ Toggle Native Desktop Icons"), Height = 35, Margin = new Thickness(0, 0, 0, 15), Background = new SolidColorBrush(Color.FromArgb(0x40, 0xFF, 0xFF, 0xFF)), Foreground = Brushes.White, Cursor = Cursors.Hand };
+            btnToggleIcons.Click += (s, e) => { ToggleDesktopIcons(); };
+            sp.Children.Add(btnToggleIcons);
+
+            CheckBox chkAutoStart = new CheckBox { Content = Loc("🚀 随 Windows 开机自动启动", "🚀 Start WinStacks with Windows"), Foreground = Brushes.White, FontSize = 13, Margin = new Thickness(0, 0, 0, 15), VerticalContentAlignment = VerticalAlignment.Center };
+            try {
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", false)) {
+                    chkAutoStart.IsChecked = (key != null && key.GetValue("WinStacks") != null);
+                }
+            } catch { }
+            sp.Children.Add(chkAutoStart);
+
+            Button btnApply = new Button { Content = Loc("✔ 保存并应用", "✔ Save & Apply"), Height = 40, Margin = new Thickness(0, 10, 0, 0), Background = new SolidColorBrush(Color.FromRgb(0, 120, 215)), Foreground = Brushes.White, BorderThickness = new Thickness(0), Cursor = Cursors.Hand };
+            btnApply.Click += (s, e) => { 
+                _appConfig["Lang"] = cbLang.SelectedIndex == 1 ? "en" : "zh";
+                
+                string recentNameEn = "Recent Files"; string recentNameZh = "最近使用";
+                bool isRecentsNowEnabled = chkRecents.IsChecked == true;
+                _appConfig["EnableRecentFiles"] = isRecentsNowEnabled ? "true" : "false";
+                
+                if (!isRecentsNowEnabled) {
+                    if (_openMenus.ContainsKey(recentNameZh)) { _openMenus[recentNameZh].Close(); _openMenus.Remove(recentNameZh); }
+                    if (_openMenus.ContainsKey(recentNameEn)) { _openMenus[recentNameEn].Close(); _openMenus.Remove(recentNameEn); }
+                }
+
+                if (int.TryParse(txtMaxFiles.Text, out int parsedMax) && parsedMax > 0 && parsedMax <= 30) { _appConfig["MaxRecentFiles"] = parsedMax.ToString(); }
+                ApplyLayout(cbLayout.SelectedIndex, true); 
+                
+                try {
+                    string exePath = Environment.ProcessPath ?? AppContext.BaseDirectory;
+                    using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true)) {
+                        if (chkAutoStart.IsChecked == true) key?.SetValue("WinStacks", $"\"{exePath}\"");
+                        else key?.DeleteValue("WinStacks", false);
+                    }
+                } catch { }
+
+                settingsWin.Close(); 
+                SetupTrayIcon();
+                RefreshDesktop(); 
+            };
             sp.Children.Add(btnApply); settingsWin.Content = sp; settingsWin.Show();
         }
 
@@ -282,11 +367,8 @@ namespace WinStacks
             }
 
             if (saveToFile) {
-                try {
-                    string appDataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "WinStacks");
-                    Directory.CreateDirectory(appDataDir);
-                    File.WriteAllText(Path.Combine(appDataDir, "layout_config.txt"), mode.ToString());
-                } catch { }
+                _appConfig["Layout"] = mode.ToString();
+                SaveConfig();
             }
         }
 
@@ -329,37 +411,70 @@ namespace WinStacks
             string desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
             string[] files = Directory.GetFiles(desktopPath); string[] directories = Directory.GetDirectories(desktopPath);
 
+            var catKeys = new { Sys = Loc("系统", "System"), Pic = Loc("照片", "Pictures"), Doc = Loc("文档", "Documents"), Vid = Loc("影片", "Videos"), Mus = Loc("音乐", "Music"), Zip = Loc("压缩包", "Archives"), App = Loc("应用程序", "Applications"), Dir = Loc("文件夹", "Folders"), Other = Loc("其他", "Others"), Recent = Loc("最近使用", "Recent Files") };
+
             var categories = new Dictionary<string, List<string>>() {
-                { "系统", new List<string>() }, { "照片", new List<string>() }, { "文档", new List<string>() }, { "影片", new List<string>() },
-                { "音乐", new List<string>() }, { "压缩包", new List<string>() }, { "应用程序", new List<string>() },
-                { "文件夹", new List<string>() }, { "其他", new List<string>() }
+                { catKeys.Sys, new List<string>() }, { catKeys.Pic, new List<string>() }, { catKeys.Doc, new List<string>() }, { catKeys.Vid, new List<string>() },
+                { catKeys.Mus, new List<string>() }, { catKeys.Zip, new List<string>() }, { catKeys.App, new List<string>() },
+                { catKeys.Dir, new List<string>() }, { catKeys.Other, new List<string>() }, { catKeys.Recent, new List<string>() }
             };
 
-            foreach (string dir in directories) categories["文件夹"].Add(dir);
-            categories["系统"].Add("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}");
-            categories["系统"].Add("::{645FF040-5081-101B-9F08-00AA002F954E}");
+            foreach (string dir in directories) categories[catKeys.Dir].Add(dir);
+            categories[catKeys.Sys].Add("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}");
+            categories[catKeys.Sys].Add("::{645FF040-5081-101B-9F08-00AA002F954E}");
+
+            bool enableRecent = _appConfig.TryGetValue("EnableRecentFiles", out string? er) ? er == "true" : true;
+            int maxRecent = _appConfig.TryGetValue("MaxRecentFiles", out string? mr) && int.TryParse(mr, out int m) ? m : 8;
+            
+            if (enableRecent) {
+                var validFiles = new List<string>();
+                foreach (string file in files) {
+                    try {
+                        FileAttributes attr = File.GetAttributes(file);
+                        if ((attr & FileAttributes.Hidden) == 0 && (attr & FileAttributes.System) == 0) validFiles.Add(file);
+                    } catch { }
+                }
+                var recentFiles = validFiles.OrderByDescending(f => File.GetLastWriteTime(f)).Take(maxRecent).ToList();
+                categories[catKeys.Recent].AddRange(recentFiles);
+            }
 
             foreach (string file in files) {
                 try {
                     FileAttributes attributes = File.GetAttributes(file);
                     if ((attributes & FileAttributes.Hidden) == FileAttributes.Hidden || (attributes & FileAttributes.System) == FileAttributes.System) continue;
                     string ext = Path.GetExtension(file).ToLower();
-                    if (ext == ".jpg" || ext == ".png" || ext == ".jpeg" || ext == ".gif" || ext == ".bmp" || ext == ".webp") categories["照片"].Add(file);
-                    else if (ext == ".doc" || ext == ".docx" || ext == ".pdf" || ext == ".txt" || ext == ".xls" || ext == ".xlsx" || ext == ".ppt" || ext == ".pptx" || ext == ".md" || ext == ".csv") categories["文档"].Add(file);
-                    else if (ext == ".mp4" || ext == ".mov" || ext == ".avi" || ext == ".mkv" || ext == ".wmv") categories["影片"].Add(file);
-                    else if (ext == ".mp3" || ext == ".wav" || ext == ".flac" || ext == ".aac" || ext == ".m4a") categories["音乐"].Add(file);
-                    else if (ext == ".zip" || ext == ".rar" || ext == ".7z" || ext == ".tar" || ext == ".gz") categories["压缩包"].Add(file);
-                    else if (ext == ".lnk" || ext == ".url" || ext == ".exe" || ext == ".bat") categories["应用程序"].Add(file);
-                    else categories["其他"].Add(file); 
+                    if (ext == ".jpg" || ext == ".png" || ext == ".jpeg" || ext == ".gif" || ext == ".bmp" || ext == ".webp") categories[catKeys.Pic].Add(file);
+                    else if (ext == ".doc" || ext == ".docx" || ext == ".pdf" || ext == ".txt" || ext == ".xls" || ext == ".xlsx" || ext == ".ppt" || ext == ".pptx" || ext == ".md" || ext == ".csv") categories[catKeys.Doc].Add(file);
+                    else if (ext == ".mp4" || ext == ".mov" || ext == ".avi" || ext == ".mkv" || ext == ".wmv") categories[catKeys.Vid].Add(file);
+                    else if (ext == ".mp3" || ext == ".wav" || ext == ".flac" || ext == ".aac" || ext == ".m4a") categories[catKeys.Mus].Add(file);
+                    else if (ext == ".zip" || ext == ".rar" || ext == ".7z" || ext == ".tar" || ext == ".gz") categories[catKeys.Zip].Add(file);
+                    else if (ext == ".lnk" || ext == ".url" || ext == ".exe" || ext == ".bat") categories[catKeys.App].Add(file);
+                    else categories[catKeys.Other].Add(file); 
                 } catch { }
             }
 
             StacksContainer.Children.Clear();
             foreach (var category in categories) {
                 if (category.Value.Count > 0) {
-                    string displayTitle = category.Key == "其他" ? $"其他" : category.Key;
-                    UIElement stackUI = CreateStackBlock(displayTitle, category.Value);
+                    UIElement stackUI = CreateStackBlock(category.Key, category.Value);
                     StacksContainer.Children.Add(stackUI);
+                }
+            }
+
+            // Auto-refresh pinned menus containing live data
+            if (enableRecent && categories[catKeys.Recent].Count > 0) {
+                if (_openMenus.ContainsKey(catKeys.Recent)) {
+                    bool keepAliveCache = _keepMenuAlive;
+                    Window oldMenu = _openMenus[catKeys.Recent];
+                    double l = oldMenu.Left, t = oldMenu.Top;
+                    _openMenus.Remove(catKeys.Recent); oldMenu.Close();
+                    // Temporary UI refresh to bypass point-collision shifts on live reload
+                    string savePosTemp = $"{l},{t}";
+                    if (!_appConfig.ContainsKey($"Stack_{catKeys.Recent}")) _appConfig[$"Stack_{catKeys.Recent}"] = savePosTemp;
+                    
+                    ShowStackMenu(this, catKeys.Recent, categories[catKeys.Recent]);
+                } else if (_appConfig.ContainsKey($"Stack_{catKeys.Recent}")) {
+                    ShowStackMenu(this, catKeys.Recent, categories[catKeys.Recent]);
                 }
             }
         }
@@ -437,7 +552,7 @@ namespace WinStacks
                 if (isDir) { Process.Start(new ProcessStartInfo { FileName = "explorer.exe", Arguments = $"\"{path}\"", UseShellExecute = true }); } 
                 else { Process.Start(new ProcessStartInfo { FileName = path, UseShellExecute = true }); }
             } catch (Exception ex) {
-                MessageBox.Show($"无法打开此项目：\n{ex.Message}", "WinStacks 错误", MessageBoxButton.OK, MessageBoxImage.Error);
+                MessageBox.Show(Loc($"无法打开此项目：\n{ex.Message}", $"Cannot open this item:\n{ex.Message}"), Loc("WinStacks 错误", "WinStacks Error"), MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
 
@@ -460,37 +575,56 @@ namespace WinStacks
 
         private void ShowStackMenu(UIElement anchor, string title, List<string> filePaths)
         {
-            if (_currentMenu != null) { 
-                try { _currentMenu.Close(); } catch { } 
-                _currentMenu = null; 
+            if (_openMenus.TryGetValue(title, out Window? existingMenu)) {
+                try { existingMenu.Activate(); return; } catch { _openMenus.Remove(title); }
             }
 
-            _currentMenu = new Window {
+            Window newMenu = new Window {
                 WindowStyle = WindowStyle.None, AllowsTransparency = false, ShowInTaskbar = false, Topmost = false, 
-                SizeToContent = SizeToContent.WidthAndHeight,
+                SizeToContent = SizeToContent.Height,
                 Background = new SolidColorBrush(Color.FromArgb(0x01, 0x00, 0x00, 0x00)), 
                 WindowStartupLocation = WindowStartupLocation.Manual
             };
-            WindowChrome.SetWindowChrome(_currentMenu, new WindowChrome { GlassFrameThickness = new Thickness(-1), CaptionHeight = 0, UseAeroCaptionButtons = false });
+            WindowChrome.SetWindowChrome(newMenu, new WindowChrome { GlassFrameThickness = new Thickness(-1), CaptionHeight = 0, UseAeroCaptionButtons = false });
 
-            _currentMenu.SourceInitialized += (s, e) => {
-                IntPtr hwnd = new WindowInteropHelper(_currentMenu).Handle;
+            newMenu.SourceInitialized += (s, e) => {
+                IntPtr hwnd = new WindowInteropHelper(newMenu).Handle;
                 int dark = 1; DwmSetWindowAttribute(hwnd, 20, ref dark, sizeof(int));
                 int backdrop = 3; DwmSetWindowAttribute(hwnd, 38, ref backdrop, sizeof(int)); 
                 int corners = 2; DwmSetWindowAttribute(hwnd, 33, ref corners, sizeof(int));
-                SetWindowPos(hwnd, new IntPtr(-1), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                
+                int exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
+                SetWindowLong(hwnd, GWL_EXSTYLE, exStyle | WS_EX_TOOLWINDOW);
+                IntPtr progman = FindWindow("Progman", null);
+                if (progman != IntPtr.Zero) SetWindowLongPtr(hwnd, GWLP_HWNDPARENT, progman);
+                SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             };
+
+            bool isPinned = _appConfig.ContainsKey($"Stack_{title}");
 
             Action safeCloseMenu = null!;
             safeCloseMenu = () => {
-                if (_currentMenu != null) {
-                    Window temp = _currentMenu;
-                    _currentMenu = null; 
+                if (_openMenus.ContainsKey(title)) {
+                    Window temp = _openMenus[title];
+                    _openMenus.Remove(title); 
+                    _menuTheoreticalPositions.Remove(title);
                     try { temp.Close(); } catch { }
                 }
             };
 
-            _currentMenu.Deactivated += (s, e) => { if (!_keepMenuAlive) { safeCloseMenu(); } };
+            newMenu.Closing += (s, e) => {
+                try {
+                    if (isPinned) {
+                        _appConfig[$"Stack_{title}"] = $"{newMenu.Left},{newMenu.Top}";
+                        SaveConfig();
+                    } else if (_appConfig.ContainsKey($"Stack_{title}")) {
+                        _appConfig.Remove($"Stack_{title}");
+                        SaveConfig();
+                    }
+                } catch { }
+            };
+
+            newMenu.Deactivated += (s, e) => { if (!_keepMenuAlive && !isPinned) { safeCloseMenu(); } };
 
             List<string> currentSelectedPaths = new List<string>();
             List<bool> isCurrentDirs = new List<bool>();
@@ -498,7 +632,7 @@ namespace WinStacks
             List<TextBlock> selectedItemTexts = new List<TextBlock>();
             List<TextBox> selectedItemBoxes = new List<TextBox>();
 
-            _currentMenu.KeyDown += (s, e) => {
+            newMenu.KeyDown += (s, e) => {
                 if (currentSelectedPaths.Count == 0) return;
 
                 if (e.Key == Key.F2 && currentSelectedPaths.Count == 1) {
@@ -535,11 +669,11 @@ namespace WinStacks
                 else if (e.Key == Key.Delete) {
                     var targets = new List<string>(currentSelectedPaths);
                     var dirs = new List<bool>(isCurrentDirs);
-                    safeCloseMenu();
+                    if (!isPinned) safeCloseMenu();
 
                     Application.Current.Dispatcher.InvokeAsync(() => {
-                        string msg = targets.Count == 1 ? $"确定要把 {Path.GetFileName(targets[0])} 移入回收站吗？" : $"确定要把这 {targets.Count} 个项目移入回收站吗？";
-                        if (MessageBox.Show(msg, "删除确认", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes) {
+                        string msg = targets.Count == 1 ? Loc($"确定要把 {Path.GetFileName(targets[0])} 移入回收站吗？", $"Move {Path.GetFileName(targets[0])} to Recycle Bin?") : Loc($"确定要把这 {targets.Count} 个项目移入回收站吗？", $"Move {targets.Count} items to Recycle Bin?");
+                        if (MessageBox.Show(msg, Loc("删除确认", "Confirm Delete"), MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes) {
                             for (int i = 0; i < targets.Count; i++) {
                                 PerformDelete(targets[i], dirs[i]);
                             }
@@ -548,23 +682,52 @@ namespace WinStacks
                 }
             };
 
-            Border menuBorder = new Border { Background = Brushes.Transparent, Padding = new Thickness(15) };
-            StackPanel outerPanel = new StackPanel { Orientation = Orientation.Vertical };
-            outerPanel.Children.Add(new TextBlock { Text = title, Foreground = new SolidColorBrush(Color.FromArgb(0xC0, 0xFF, 0xFF, 0xFF)), FontWeight = FontWeights.SemiBold, FontSize = 12, Margin = new Thickness(4, 0, 0, 12) });
-            
+            Border menuBorder = new Border { Background = Brushes.Transparent, Padding = new Thickness(15), Cursor = Cursors.Arrow };
+            menuBorder.MouseLeftButtonDown += (s, e) => {
+                if (e.OriginalSource is ScrollViewer || e.OriginalSource is TextBox || e.OriginalSource is Button || e.OriginalSource is MenuItem) return;
+                try { newMenu.DragMove(); } catch { }
+            };
 
             int columnCount = Math.Min(6, filePaths.Count);
             double dynamicWidth = columnCount * 84; 
+            double windowWidth = Math.Max(145, dynamicWidth + 30); 
+            newMenu.Width = windowWidth;
             
+            Grid outerPanel = new Grid { HorizontalAlignment = HorizontalAlignment.Stretch, VerticalAlignment = VerticalAlignment.Stretch };
+            outerPanel.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            outerPanel.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+
+            Grid headerGrid = new Grid { Margin = new Thickness(0, 0, 0, 12), Background = Brushes.Transparent, HorizontalAlignment = HorizontalAlignment.Stretch };
+            headerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            headerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            
+            TextBlock titleTb = new TextBlock { Text = title, Foreground = new SolidColorBrush(Color.FromArgb(0xC0, 0xFF, 0xFF, 0xFF)), FontWeight = FontWeights.SemiBold, FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
+            Grid.SetColumn(titleTb, 0); headerGrid.Children.Add(titleTb);
+            
+            TextBlock pinBtn = new TextBlock { Text = "📌", Foreground = isPinned ? new SolidColorBrush(Color.FromRgb(0, 120, 215)) : new SolidColorBrush(Color.FromArgb(0x60, 0xFF, 0xFF, 0xFF)), FontSize = 12, Cursor = Cursors.Hand, ToolTip = Loc("固定位置 (支持自由拖拽保存坐标)", "Pin Position (Draggable)"), VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Right, Padding = new Thickness(5, 0, 0, 0) };
+            Grid.SetColumn(pinBtn, 1); headerGrid.Children.Add(pinBtn);
+            pinBtn.MouseLeftButtonDown += (s, e) => {
+                isPinned = !isPinned;
+                pinBtn.Foreground = isPinned ? new SolidColorBrush(Color.FromRgb(0, 120, 215)) : new SolidColorBrush(Color.FromArgb(0x60, 0xFF, 0xFF, 0xFF));
+                if (!isPinned && _appConfig.ContainsKey($"Stack_{title}")) {
+                    _appConfig.Remove($"Stack_{title}"); SaveConfig();
+                }
+                e.Handled = true;
+            };
+
+            Grid.SetRow(headerGrid, 0);
+            outerPanel.Children.Add(headerGrid);
+
             WrapPanel gridPanel = new WrapPanel { 
                 Orientation = Orientation.Horizontal, 
-                Width = dynamicWidth 
+                Width = dynamicWidth,
+                HorizontalAlignment = HorizontalAlignment.Center
             };
 
             foreach (string path in filePaths) {
                 string fileName = Path.GetFileName(path);
-                if (path == "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}") fileName = "此电脑";
-                else if (path == "::{645FF040-5081-101B-9F08-00AA002F954E}") fileName = "回收站";
+                if (path == "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}") fileName = Loc("此电脑", "This PC");
+                else if (path == "::{645FF040-5081-101B-9F08-00AA002F954E}") fileName = Loc("回收站", "Recycle Bin");
 
                 bool isDir = Directory.Exists(path) || path.StartsWith("::");
 
@@ -618,17 +781,17 @@ namespace WinStacks
                 
                 ContextMenu ctxMenu = new ContextMenu();
                 
-                MenuItem openItem = new MenuItem { Header = "打开" };
+                MenuItem openItem = new MenuItem { Header = Loc("打开", "Open") };
                 openItem.Click += (s, e) => { 
-                    safeCloseMenu(); 
+                    if (!isPinned) safeCloseMenu(); 
                     Application.Current.Dispatcher.InvokeAsync(() => { SafeOpenItem(path, isDir); });
                 };
                 ctxMenu.Items.Add(openItem);
 
                 if (!isDir) {
-                    MenuItem openWithItem = new MenuItem { Header = "打开方式..." };
+                    MenuItem openWithItem = new MenuItem { Header = Loc("打开方式...", "Open with...") };
                     openWithItem.Click += (s, e) => { 
-                        safeCloseMenu();
+                        if (!isPinned) safeCloseMenu();
                         Application.Current.Dispatcher.InvokeAsync(() => {
                             try {
                                 OPENASINFO info = new OPENASINFO { pcszFile = path, pcszClass = null, oaUI = OAIF_ALLOW_REGISTRATION | OAIF_EXEC };
@@ -640,9 +803,9 @@ namespace WinStacks
                 }
                 
                 ctxMenu.Items.Add(new Separator());
-                MenuItem copyItem = new MenuItem { Header = "复制" };
+                MenuItem copyItem = new MenuItem { Header = Loc("复制", "Copy") };
                 copyItem.Click += (s, e) => { 
-                    safeCloseMenu();
+                    if (!isPinned) safeCloseMenu();
                     Application.Current.Dispatcher.InvokeAsync(() => {
                         try { 
                             var sc = new System.Collections.Specialized.StringCollection(); 
@@ -653,9 +816,9 @@ namespace WinStacks
                 };
                 ctxMenu.Items.Add(copyItem);
 
-                MenuItem showItem = new MenuItem { Header = "在文件夹中显示" };
+                MenuItem showItem = new MenuItem { Header = Loc("在文件夹中显示", "Show in folder") };
                 showItem.Click += (s, e) => { 
-                    safeCloseMenu();
+                    if (!isPinned) safeCloseMenu();
                     Application.Current.Dispatcher.InvokeAsync(() => {
                         try { Process.Start("explorer.exe", $"/select,\"{path}\""); } catch { } 
                     });
@@ -663,9 +826,9 @@ namespace WinStacks
                 ctxMenu.Items.Add(showItem);
                 ctxMenu.Items.Add(new Separator());
 
-                MenuItem propItem = new MenuItem { Header = "属性" };
+                MenuItem propItem = new MenuItem { Header = Loc("属性", "Properties") };
                 propItem.Click += (s, e) => { 
-                    safeCloseMenu();
+                    if (!isPinned) safeCloseMenu();
                     Application.Current.Dispatcher.InvokeAsync(() => {
                         try {
                             SHELLEXECUTEINFO info = new SHELLEXECUTEINFO(); info.cbSize = Marshal.SizeOf(info); info.lpVerb = "properties"; info.lpFile = path; info.nShow = 5; info.fMask = SEE_MASK_INVOKEIDLIST;
@@ -675,7 +838,7 @@ namespace WinStacks
                 };
                 if (!path.StartsWith("::")) ctxMenu.Items.Add(propItem);
 
-                MenuItem renameItem = new MenuItem { Header = "重命名 (F2)" };
+                MenuItem renameItem = new MenuItem { Header = Loc("重命名 (F2)", "Rename (F2)") };
                 renameItem.Click += (s, e) => {
                     if (!path.StartsWith("::")) {
                         itemText.Visibility = Visibility.Collapsed;
@@ -687,18 +850,18 @@ namespace WinStacks
                 };
                 if (!path.StartsWith("::")) ctxMenu.Items.Add(renameItem);
 
-                MenuItem delItem = new MenuItem { Header = "删除文件", Foreground = Brushes.Red };
+                MenuItem delItem = new MenuItem { Header = Loc("删除文件", "Delete"), Foreground = Brushes.Red };
                 delItem.Click += (s, e) => {
-                    safeCloseMenu(); 
+                    if (!isPinned) safeCloseMenu(); 
                     Application.Current.Dispatcher.InvokeAsync(() => {
                         if (currentSelectedPaths.Contains(path) && currentSelectedPaths.Count > 1) {
-                            if (MessageBox.Show($"确定要把这 {currentSelectedPaths.Count} 个项目移入回收站吗？", "删除确认", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes) {
+                            if (MessageBox.Show(Loc($"确定要把这 {currentSelectedPaths.Count} 个项目移入回收站吗？", $"Move {currentSelectedPaths.Count} items to Recycle Bin?"), Loc("删除确认", "Confirm Delete"), MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes) {
                                 for(int i=0; i<currentSelectedPaths.Count; i++) {
                                     if (!currentSelectedPaths[i].StartsWith("::")) PerformDelete(currentSelectedPaths[i], isCurrentDirs[i]);
                                 }
                             }
                         } else {
-                            if (MessageBox.Show($"确定要把 {fileName} 移入回收站吗？", "删除确认", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes) {
+                            if (MessageBox.Show(Loc($"确定要把 {fileName} 移入回收站吗？", $"Move {fileName} to Recycle Bin?"), Loc("删除确认", "Confirm Delete"), MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes) {
                                 PerformDelete(path, isDir);
                             }
                         }
@@ -718,7 +881,7 @@ namespace WinStacks
 
                     if (e.ClickCount == 2) {
                         isMouseDown = false;
-                        safeCloseMenu();
+                        if (!isPinned) safeCloseMenu();
                         Application.Current.Dispatcher.InvokeAsync(() => { SafeOpenItem(path, isDir); });
                         e.Handled = true;
                     } else {
@@ -770,7 +933,7 @@ namespace WinStacks
                         startPoint = e.GetPosition(null); 
                         isMouseDown = true;
                         
-                        if (_currentMenu != null) { _currentMenu.Focus(); } 
+                        newMenu.Focus(); 
                     }
                 };
 
@@ -862,44 +1025,91 @@ namespace WinStacks
                 e.Handled = true;
             };
 
+            Grid.SetRow(scrollViewer, 1);
             outerPanel.Children.Add(scrollViewer);
             menuBorder.Child = outerPanel; 
-            if (_currentMenu != null) _currentMenu.Content = menuBorder;
+            newMenu.Content = menuBorder;
 
-            if (_currentMenu != null)
-            {
-                menuBorder.Measure(new Size(Double.PositiveInfinity, maxAllowedHeight + 50)); 
-                double menuWidth = menuBorder.DesiredSize.Width; 
-                double menuHeight = menuBorder.DesiredSize.Height;
-                
-                PresentationSource source = PresentationSource.FromVisual(this);
-                double dpiX = 1.0; double dpiY = 1.0;
-                if (source != null && source.CompositionTarget != null) { dpiX = source.CompositionTarget.TransformToDevice.M11; dpiY = source.CompositionTarget.TransformToDevice.M22; }
-                Point screenPos = anchor.PointToScreen(new Point(0, 0));
-                double logicalX = screenPos.X / dpiX; double logicalY = screenPos.Y / dpiY;
+            menuBorder.Measure(new Size(Double.PositiveInfinity, maxAllowedHeight + 50)); 
+            double menuWidth = windowWidth; 
+            double menuHeight = menuBorder.DesiredSize.Height;
+            
+            PresentationSource source = PresentationSource.FromVisual(this);
+            double dpiX = 1.0; double dpiY = 1.0;
+            if (source != null && source.CompositionTarget != null) { dpiX = source.CompositionTarget.TransformToDevice.M11; dpiY = source.CompositionTarget.TransformToDevice.M22; }
+            Point screenPos = anchor.PointToScreen(new Point(0, 0));
+            double logicalX = screenPos.X / dpiX; double logicalY = screenPos.Y / dpiY;
 
-                Rect workArea = SystemParameters.WorkArea;
-                
-                double left = logicalX - (menuWidth / 2) + 37; 
-                if (StacksContainer.HorizontalAlignment == HorizontalAlignment.Right) {
-                    left = logicalX - menuWidth + 20; 
-                } else if (StacksContainer.HorizontalAlignment == HorizontalAlignment.Left) {
-                    left = logicalX + 80; 
+            Rect workArea = SystemParameters.WorkArea;
+            
+            double left = logicalX - (menuWidth / 2) + 37; 
+            if (StacksContainer.HorizontalAlignment == HorizontalAlignment.Right) {
+                left = logicalX - menuWidth + 20; 
+            } else if (StacksContainer.HorizontalAlignment == HorizontalAlignment.Left) {
+                left = logicalX + 80; 
+            }
+
+            double top = logicalY + 110;
+            if (StacksContainer.VerticalAlignment == VerticalAlignment.Bottom) { top = logicalY - menuHeight - 15; }
+
+            double margin = 25;
+            if (left < workArea.Left + margin) left = workArea.Left + margin; 
+            if (left + menuWidth > workArea.Right - margin) left = workArea.Right - menuWidth - margin; 
+            if (top < workArea.Top + margin) top = workArea.Top + margin; 
+            if (top + menuHeight > workArea.Bottom - margin) top = workArea.Bottom - menuHeight - margin; 
+
+            if (_appConfig.TryGetValue($"Stack_{title}", out string? savedPos)) {
+                var parts = savedPos.Split(',');
+                if (parts.Length == 2 && double.TryParse(parts[0], out double sx) && double.TryParse(parts[1], out double sy)) {
+                    left = sx; top = sy;
+                }
+            } else {
+                bool overlapping = true;
+                int attempts = 0;
+                while (overlapping && attempts < 15) {
+                    overlapping = false;
+                    Rect newRect = new Rect(left - 5, top - 5, menuWidth + 10, menuHeight + 10);
+                    foreach (var kvp in _openMenus) {
+                        Window win = kvp.Value;
+                        double wl = win.Left;
+                        double wt = win.Top;
+                        double ww = win.ActualWidth > 0 ? win.ActualWidth : (_menuTheoreticalPositions.ContainsKey(kvp.Key) ? _menuTheoreticalPositions[kvp.Key].Width : 200);
+                        double wh = win.ActualHeight > 0 ? win.ActualHeight : (_menuTheoreticalPositions.ContainsKey(kvp.Key) ? _menuTheoreticalPositions[kvp.Key].Height : 200);
+                        
+                        if (double.IsNaN(wl) || double.IsNaN(wt)) {
+                            if (_menuTheoreticalPositions.ContainsKey(kvp.Key)) {
+                                wl = _menuTheoreticalPositions[kvp.Key].Left;
+                                wt = _menuTheoreticalPositions[kvp.Key].Top;
+                            } else continue;
+                        }
+
+                        Rect existingRect = new Rect(wl, wt, ww, wh);
+                        if (newRect.IntersectsWith(existingRect)) {
+                            if (StacksContainer.HorizontalAlignment == HorizontalAlignment.Right) {
+                                left = existingRect.Left - menuWidth - 15;
+                            } else if (StacksContainer.HorizontalAlignment == HorizontalAlignment.Left) {
+                                left = existingRect.Right + 15;
+                            } else {
+                                left -= 40; top -= 40;
+                            }
+                            overlapping = true;
+                            break;
+                        }
+                    }
+                    attempts++;
                 }
 
-                double top = logicalY + 110;
-                if (StacksContainer.VerticalAlignment == VerticalAlignment.Bottom) { top = logicalY - menuHeight - 15; }
-
-                double margin = 25;
                 if (left < workArea.Left + margin) left = workArea.Left + margin; 
                 if (left + menuWidth > workArea.Right - margin) left = workArea.Right - menuWidth - margin; 
                 if (top < workArea.Top + margin) top = workArea.Top + margin; 
                 if (top + menuHeight > workArea.Bottom - margin) top = workArea.Bottom - menuHeight - margin; 
-
-                _currentMenu.Left = left; _currentMenu.Top = top; 
-                _currentMenu.Show(); 
-                _currentMenu.Activate(); 
             }
+
+            _menuTheoreticalPositions[title] = new Rect(left, top, menuWidth, menuHeight);
+            newMenu.Left = left; newMenu.Top = top; 
+            _openMenus[title] = newMenu;
+            newMenu.Show(); 
+            newMenu.Activate(); 
         }
     }
 }

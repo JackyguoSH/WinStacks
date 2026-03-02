@@ -13,8 +13,8 @@
     <Product>WinStacks</Product>
     <Description>一款 Windows 智能桌面叠放工具</Description>
     <Copyright>Copyright © 2026 Jacky. All rights reserved.</Copyright>
-    <FileVersion>1.2</FileVersion>
-    <AssemblyVersion>1.2</AssemblyVersion>
+    <FileVersion>1.3</FileVersion>
+    <AssemblyVersion>1.3</AssemblyVersion>
   </PropertyGroup>
 
 </Project>
